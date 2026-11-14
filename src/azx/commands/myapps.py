@@ -8,11 +8,11 @@ from urllib.parse import quote
 from ..api import GraphClient
 from ..context import Context
 from ..errors import ApiError, UsageError
-from ..util import is_guid
+from ..util import is_guid, yes_no
 from .common import dry_run, require_guid
 
 DEFAULT_APP_ROLE = "00000000-0000-0000-0000-000000000000"
-SP_SELECT = "id,appId,displayName,appRoles"
+SP_SELECT = "id,appId,displayName,appRoles,appRoleAssignmentRequired"
 
 
 def _user_role(role: dict[str, Any]) -> bool:
@@ -32,25 +32,43 @@ def _resolve_app_sp(graph: GraphClient, reference: str) -> dict[str, Any]:
             "object ID (GUID)."
         )
     try:
-        return graph.get(
-            f"/servicePrincipals(appId='{quote(text)}')",
-            params={"$select": SP_SELECT},
+        data = graph.get(
+            "/servicePrincipals",
+            params={
+                "$filter": f"id eq '{text}' or appId eq '{text}'",
+                "$select": SP_SELECT,
+            },
         )
     except ApiError as exc:
-        if exc.status_code != 404:
-            raise
-    try:
-        return graph.get(
-            f"/servicePrincipals/{quote(text)}",
-            params={"$select": SP_SELECT},
+        if exc.status_code in {400, 404}:
+            raise UsageError(
+                f"Enterprise application not found for appId or service "
+                f"principal object ID {text}."
+            ) from exc
+        raise
+    items = data.get("value")
+    if not isinstance(items, list):
+        items = []
+    matches = [
+        item
+        for item in items
+        if isinstance(item, dict)
+        and (
+            str(item.get("id", "")).casefold() == text.casefold()
+            or str(item.get("appId", "")).casefold() == text.casefold()
         )
-    except ApiError as exc:
-        if exc.status_code != 404:
-            raise
+    ]
+    if not matches:
         raise UsageError(
-            f"Enterprise application not found for appId or service "
-            f"principal object ID {text}."
-        ) from exc
+            f"Enterprise application not found for appId or service principal "
+            f"object ID {text}."
+        )
+    if len(matches) > 1:
+        raise UsageError(
+            f"Enterprise application identifier {text} matched multiple "
+            "service principals."
+        )
+    return matches[0]
 
 
 def _role_id(service_principal: dict[str, Any], reference: str | None) -> str:
@@ -104,50 +122,79 @@ def _role_name(service_principal: dict[str, Any], app_role_id: str) -> str:
     return app_role_id
 
 
-def _print_assignments(
+def _print_app_roles(
     ctx: Context,
-    assignments: list[dict[str, Any]],
+    service_principals: list[dict[str, Any]],
 ) -> None:
-    rows = [
-        [
-            assignment.get("resourceDisplayName")
-            or assignment.get("resourceId")
-            or "-",
-            assignment.get("resourceId") or "-",
-            assignment.get("appRoleId") or DEFAULT_APP_ROLE,
-            assignment.get("id") or "-",
+    rows = []
+    for service_principal in service_principals:
+        roles = [
+            role for role in service_principal.get("appRoles") or [] if _user_role(role)
         ]
-        for assignment in assignments
-    ]
+        if not roles:
+            continue
+        labels = ", ".join(
+            str(role.get("displayName") or role.get("value") or role.get("id") or "-")
+            for role in roles
+        )
+        rows.append(
+            [
+                service_principal.get("displayName") or "-",
+                service_principal.get("appId") or "-",
+                service_principal.get("id") or "-",
+                labels,
+            ]
+        )
+    if not rows:
+        ctx.console.line("No enterprise applications expose user-assignable roles.")
+        return
+    rows.sort(key=lambda row: str(row[0]).casefold())
     ctx.console.table(
-        ["APPLICATION", "RESOURCE ID", "ROLE ID", "ASSIGNMENT ID"],
+        ["APPLICATION", "APP ID", "OBJECT ID", "ASSIGNABLE ROLES"],
         rows,
+    )
+
+
+def handle_get(ctx: Context, args: Any) -> None:
+    graph = ctx.graph()
+    service_principal = _resolve_app_sp(graph, args.app)
+    ctx.console.kv("Application", service_principal.get("displayName") or "-")
+    ctx.console.kv("App ID", service_principal.get("appId") or "-")
+    ctx.console.kv("Object ID", service_principal.get("id") or "-")
+    ctx.console.kv(
+        "App role assignment required",
+        yes_no(service_principal.get("appRoleAssignmentRequired")),
+    )
+    roles = [
+        role for role in service_principal.get("appRoles") or [] if _user_role(role)
+    ]
+    if not roles:
+        ctx.console.line("No user-assignable roles (default access only).")
+        return
+    ctx.console.heading("Assignable roles")
+    ctx.console.table(
+        ["ROLE", "ROLE ID", "VALUE"],
+        [
+            [
+                role.get("displayName") or role.get("value") or "-",
+                role.get("id") or "-",
+                role.get("value") or "-",
+            ]
+            for role in roles
+        ],
     )
 
 
 def handle_list(ctx: Context, args: Any) -> None:
     graph = ctx.graph()
-    if args.user:
-        user_id = require_guid(args.user, "User")
-        principal_path = quote(user_id)
-        collection = "users"
-    else:
-        token = ctx.current_token
-        if token is None or not token.has_access_token:
-            raise UsageError("No active token is available.")
-        principal_id = token.principal_id or ""
-        if not principal_id:
-            raise UsageError("The active token has no principal object ID.")
-        collection = "servicePrincipals" if token.is_app else "users"
-        principal_path = quote(principal_id)
-    assignments = graph.get_all(
-        f"/{collection}/{principal_path}/appRoleAssignments",
-        params={"$top": "999"},
+    service_principals = graph.get_all(
+        "/servicePrincipals",
+        params={
+            "$select": "id,appId,displayName,appRoles",
+            "$top": "999",
+        },
     )
-    if not assignments:
-        ctx.console.line("No app role assignments found.")
-        return
-    _print_assignments(ctx, assignments)
+    _print_app_roles(ctx, service_principals)
 
 
 def handle_assign(ctx: Context, args: Any) -> None:

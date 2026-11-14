@@ -67,6 +67,7 @@ from .commands.methods import (
 )
 from .commands.myapps import (
     handle_assign as myapps_assign,
+    handle_get as myapps_get,
     handle_list as myapps_list,
     handle_unassign as myapps_unassign,
 )
@@ -94,8 +95,8 @@ from .commands.token_cmds import (
     handle_select,
     handle_show,
 )
-from .config import Settings, resolve_tokens_dir
-from .console import Output
+from .config import DEFAULT_USER_AGENT, Settings, resolve_tokens_dir
+from .console import Output, Transcript
 from .context import Context
 from .errors import AzxError
 from .http import HttpClient
@@ -139,10 +140,26 @@ class AzxHelpFormatter(argparse.RawDescriptionHelpFormatter):
         return super()._format_usage(usage, filtered_actions, filtered_groups, prefix)
 
 
+class ParserExit(Exception):
+    def __init__(self, status: int, messages: list[tuple[str, Any]]) -> None:
+        self.status = status
+        self.messages = messages
+
+
 class AzxArgumentParser(argparse.ArgumentParser):
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         kwargs.setdefault("formatter_class", AzxHelpFormatter)
         super().__init__(*args, **kwargs)
+        self._messages: list[tuple[str, Any]] = []
+
+    def _print_message(self, message: str, file: Any = None) -> None:
+        if message:
+            self._messages.append((message, file or sys.stdout))
+
+    def exit(self, status: int = 0, message: str | None = None) -> None:
+        if message:
+            self._messages.append((message, sys.stderr))
+        raise ParserExit(status, list(self._messages))
 
     def format_usage(self) -> str:
         return "\n" + super().format_usage()
@@ -158,38 +175,44 @@ class AzxArgumentParser(argparse.ArgumentParser):
         self.exit(2, f"\n{self.prog}: error: {message}\n")
 
 
-def _common_parser() -> argparse.ArgumentParser:
+def _common_parser(*, visible: bool) -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(add_help=False)
-    group = parser.add_argument_group("global options")
-    group.add_argument(
+    target: Any = parser.add_argument_group("global options") if visible else parser
+
+    def add(*args: Any, **kwargs: Any) -> None:
+        if not visible:
+            kwargs["help"] = argparse.SUPPRESS
+        target.add_argument(*args, **kwargs)
+
+    add(
         "--token",
         dest="token_name",
         metavar="NAME",
         default=argparse.SUPPRESS,
         help="Use a specific token for this command.",
     )
-    group.add_argument(
+    add(
         "-o",
         "--output",
         metavar="FILE",
         default=argparse.SUPPRESS,
         help="Save exactly what is displayed to FILE.",
     )
-    group.add_argument(
+    add(
         "--proxy",
         metavar="URL",
         default=argparse.SUPPRESS,
         help="HTTP or SOCKS proxy URL; disables TLS certificate verification.",
     )
-    group.add_argument(
+    add(
         "-ua",
         "--user-agent",
         dest="user_agent",
         metavar="STRING",
         default=argparse.SUPPRESS,
-        help="Custom HTTP User-Agent.",
+        help=f"HTTP User-Agent; defaults to {DEFAULT_USER_AGENT}.",
     )
-    group.add_argument(
+    add(
         "-H",
         "--headers",
         dest="headers",
@@ -198,21 +221,21 @@ def _common_parser() -> argparse.ArgumentParser:
         default=argparse.SUPPRESS,
         help='Additional request header as "Name: Value"; repeatable.',
     )
-    group.add_argument(
+    add(
         "--timeout",
         type=float,
         metavar="SECONDS",
         default=argparse.SUPPRESS,
         help="HTTP request timeout in seconds.",
     )
-    group.add_argument(
+    add(
         "--debug",
         dest="debug_http",
         action="store_true",
         default=argparse.SUPPRESS,
-        help="Print redacted HTTP requests and responses.",
+        help="Print HTTP requests and responses.",
     )
-    group.add_argument(
+    add(
         "--dry-run",
         action="store_true",
         default=argparse.SUPPRESS,
@@ -221,7 +244,8 @@ def _common_parser() -> argparse.ArgumentParser:
     return parser
 
 
-COMMON = _common_parser()
+COMMON = _common_parser(visible=True)
+COMMON_SUB = _common_parser(visible=False)
 
 USER_HELP = "User object ID (GUID) or UPN."
 USER_ID_HELP = "User object ID (GUID)."
@@ -238,7 +262,7 @@ MYAPPS_USER_HELP = "User object ID (GUID)."
 def _command(
     subparsers: Any, name: str, help_text: str, **kwargs: Any
 ) -> argparse.ArgumentParser:
-    return subparsers.add_parser(name, parents=[COMMON], help=help_text, **kwargs)
+    return subparsers.add_parser(name, parents=[COMMON_SUB], help=help_text, **kwargs)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -1070,21 +1094,28 @@ def build_parser() -> argparse.ArgumentParser:
     myapps = _command(
         subparsers,
         "myapps",
-        "Enterprise application role assignments.",
+        "Enterprise application roles.",
     )
     myapps_sub = myapps.add_subparsers(
         dest="myapps_command", required=True, metavar="command"
     )
     myapps_list_parser = _command(
-        myapps_sub, "list", "List enterprise application assignments."
-    )
-    myapps_list_parser.add_argument(
-        "user",
-        nargs="?",
-        metavar="USER",
-        help="Optional user object ID (GUID); defaults to the active token.",
+        myapps_sub,
+        "list",
+        "List enterprise applications with user-assignable roles.",
     )
     myapps_list_parser.set_defaults(func=myapps_list)
+    myapps_get_parser = _command(
+        myapps_sub,
+        "get",
+        "Get an enterprise application's user-assignable roles.",
+    )
+    myapps_get_parser.add_argument(
+        "app",
+        metavar="APP",
+        help="Enterprise application appId or service principal object ID (GUID).",
+    )
+    myapps_get_parser.set_defaults(func=myapps_get)
     myapps_assign_parser = _command(
         myapps_sub, "assign", "Assign a user to an enterprise application."
     )
@@ -1190,9 +1221,78 @@ def _plain_error(message: str) -> None:
     print(f"Error: {message}", file=sys.stderr)
 
 
+def _find_output_arg(argv: Sequence[str] | None) -> Path | None:
+    values = list(sys.argv[1:] if argv is None else argv)
+    output: str | None = None
+    index = 0
+    while index < len(values):
+        value = values[index]
+        if value in {"-o", "--output"}:
+            if index + 1 < len(values):
+                candidate = values[index + 1]
+                if candidate and not candidate.startswith("-"):
+                    output = candidate
+                    index += 2
+                    continue
+        elif value.startswith("--output="):
+            candidate = value.split("=", 1)[1]
+            if candidate:
+                output = candidate
+        elif value.startswith("-o") and len(value) > 2:
+            candidate = value[2:]
+            if candidate:
+                output = candidate
+        index += 1
+    return Path(output).expanduser() if output else None
+
+
+def _flush_parser_exit(
+    failure: ParserExit,
+    argv: Sequence[str] | None,
+) -> int:
+    status = failure.status
+    output = _find_output_arg(argv)
+    transcript: Transcript | None = None
+    errors: list[str] = []
+    if output is not None:
+        if _is_protected_output(output, resolve_tokens_dir()):
+            status = 1
+            errors.append(
+                f"Error: Refusing to write the output transcript over the "
+                f"token store file {output}."
+            )
+        else:
+            try:
+                transcript = Transcript(output)
+            except AzxError as exc:
+                status = 1
+                errors.append(f"Error: {exc}")
+
+    for message, stream in failure.messages:
+        target = sys.stderr if stream is sys.stderr else sys.stdout
+        try:
+            target.write(message)
+            target.flush()
+        except BrokenPipeError:
+            if transcript is not None:
+                transcript.close()
+            return 0
+        if transcript is not None:
+            transcript.write(message)
+
+    if transcript is not None:
+        transcript.close()
+    for error in errors:
+        sys.stderr.write(error + "\n")
+    return status
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = build_parser()
-    args = parser.parse_args(argv)
+    try:
+        args = parser.parse_args(argv)
+    except ParserExit as exc:
+        return _flush_parser_exit(exc, argv)
 
     try:
         raw_output = _output_path(args)

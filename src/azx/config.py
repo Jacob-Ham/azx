@@ -7,11 +7,13 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from . import __version__
+from requests.utils import default_user_agent
+
 from .errors import UsageError
 
 DEFAULT_TOKENS_DIR = "~/.azxtokens"
 DEFAULT_TIMEOUT = 30.0
+DEFAULT_USER_AGENT = default_user_agent()
 
 
 def resolve_tokens_dir() -> Path:
@@ -27,7 +29,7 @@ class Settings:
     tokens_dir: Path
     timeout: float = DEFAULT_TIMEOUT
     proxy: str | None = None
-    user_agent: str = f"azx/{__version__}"
+    user_agent: str = DEFAULT_USER_AGENT
     headers: dict[str, str] = field(default_factory=dict)
     debug_http: bool = False
     output: Path | None = None
@@ -65,7 +67,7 @@ class Settings:
             tokens_dir=tokens_dir,
             timeout=float(timeout),
             proxy=getattr(args, "proxy", None) or None,
-            user_agent=getattr(args, "user_agent", None) or f"azx/{__version__}",
+            user_agent=getattr(args, "user_agent", None) or DEFAULT_USER_AGENT,
             headers=headers,
             debug_http=bool(getattr(args, "debug_http", False)),
             output=output_path,

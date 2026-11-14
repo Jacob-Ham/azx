@@ -1,4 +1,5 @@
 httpx[socks]>=0.27
 prompt-toolkit>=3.0
+requests>=2.31
 rich>=13.7
 seamlesspass==0.0.1

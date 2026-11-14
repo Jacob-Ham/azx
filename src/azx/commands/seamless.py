@@ -5,16 +5,21 @@ from __future__ import annotations
 import base64
 import logging
 import types
-import warnings
 from typing import Any
+from uuid import uuid4
+from xml.etree import ElementTree
 
 from ..aliases import resolve_client, resolve_resource
 from ..context import Context
-from ..errors import AuthError, TokenError, UsageError
+from ..errors import ApiError, AuthError, AzxError, TokenError, UsageError
 from ..jwt import decode_jwt
 from ..model import TokenRecord
 from ..tokenmeta import build_record, default_token_name, detect_token_type
 from ..util import validate_token_name
+
+_LOGIN_BASE = "https://login.microsoftonline.com"
+_SSO_CHECK_URL = f"{_LOGIN_BASE}/common/GetCredentialType"
+_AUTOLOGON_BASE = "https://autologon.microsoftazuread-sso.com"
 
 
 class _LogCapture(logging.Handler):
@@ -72,6 +77,128 @@ def _flow_description(args: Any) -> str:
     return "Domain authentication using " + ", ".join(methods)
 
 
+def _check_seamless_sso(ctx: Context, tenant: str) -> bool:
+    payload = {
+        "username": f"info@{tenant}",
+        "isOtherIdpSupported": True,
+        "checkPhones": True,
+        "isRemoteNGCSupported": True,
+        "isCookieBannerShown": False,
+        "isFidoSupported": True,
+        "isAccessPassSupported": True,
+    }
+    try:
+        response = ctx.http.request(
+            "POST",
+            _SSO_CHECK_URL,
+            json_body=payload,
+            idempotent=False,
+        )
+        data = response.json()
+    except (AzxError, ValueError) as exc:
+        ctx.console.debug(f"Seamless SSO check failed: {exc}")
+        return False
+    if not isinstance(data, dict):
+        return False
+    properties = data.get("EstsProperties")
+    return isinstance(properties, dict) and properties.get("DesktopSsoEnabled") is True
+
+
+def _get_dsso_token(ctx: Context, tenant: str, kerberos_ticket: str) -> str:
+    request_id = str(uuid4())
+    url = (
+        f"{_AUTOLOGON_BASE}/{tenant}/winauth/trust/2005/windowstransport"
+        f"?client-request-id={request_id}"
+    )
+    body = f"""<?xml version='1.0' encoding='UTF-8'?>
+<s:Envelope xmlns:s='http://www.w3.org/2003/05/soap-envelope' xmlns:wsse='http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-secext-1.0.xsd' xmlns:saml='urn:oasis:names:tc:SAML:1.0:assertion' xmlns:wsp='http://schemas.xmlsoap.org/ws/2004/09/policy' xmlns:wsu='http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-utility-1.0.xsd' xmlns:wsa='http://www.w3.org/2005/08/addressing' xmlns:wssc='http://schemas.xmlsoap.org/ws/2005/02/sc' xmlns:wst='http://schemas.xmlsoap.org/ws/2005/02/trust'>
+    <s:Header>
+        <wsa:Action s:mustUnderstand='1'>http://schemas.xmlsoap.org/ws/2005/02/trust/RST/Issue</wsa:Action>
+        <wsa:To s:mustUnderstand='1'>{url}</wsa:To>
+        <wsa:MessageID>urn:uuid:{request_id}</wsa:MessageID>
+    </s:Header>
+    <s:Body>
+        <wst:RequestSecurityToken Id='RST0'>
+            <wst:RequestType>http://schemas.xmlsoap.org/ws/2005/02/trust/Issue</wst:RequestType>
+            <wsp:AppliesTo>
+                <wsa:EndpointReference>
+                    <wsa:Address>urn:federation:MicrosoftOnline</wsa:Address>
+                </wsa:EndpointReference>
+            </wsp:AppliesTo>
+            <wst:KeyType>http://schemas.xmlsoap.org/ws/2005/05/identity/NoProofKey</wst:KeyType>
+        </wst:RequestSecurityToken>
+    </s:Body>
+</s:Envelope>"""
+    headers = {
+        "Accept": "application/soap+xml",
+        "SOAPAction": "http://schemas.xmlsoap.org/ws/2005/02/trust/RST/Issue",
+        "Authorization": f"Negotiate {kerberos_ticket}",
+        "Content-Type": "application/soap+xml; charset=utf-8",
+    }
+    try:
+        response = ctx.http.request(
+            "POST",
+            url,
+            headers=headers,
+            data=body,
+            idempotent=False,
+        )
+    except ApiError as exc:
+        if exc.status_code == 403:
+            raise AuthError(
+                "Failed to authenticate to the cloud using the Kerberos ticket. "
+                "Verify the ticket is valid and Seamless SSO is enabled."
+            ) from exc
+        raise
+    try:
+        document = ElementTree.fromstring(response.content)
+    except ElementTree.ParseError as exc:
+        raise AuthError(f"Desktop SSO returned invalid XML: {exc}") from exc
+    element = document.find(".//DesktopSsoToken")
+    if element is None or not element.text:
+        raise AuthError("Desktop SSO did not return a token.")
+    return element.text
+
+
+def _get_access_token(
+    ctx: Context,
+    tenant: str,
+    client: str,
+    resource: str,
+    dsso_token: str,
+) -> dict[str, Any]:
+    assertion = (
+        '<saml:Assertion xmlns:saml="urn:oasis:names:tc:SAML:1.0:assertion">'
+        f"<DesktopSsoToken>{dsso_token}</DesktopSsoToken>"
+        "</saml:Assertion>"
+    )
+    body = {
+        "grant_type": "urn:ietf:params:oauth:grant-type:saml1_1-bearer",
+        "assertion": base64.b64encode(assertion.encode("utf-8")).decode("utf-8"),
+        "client_id": client,
+        "resource": resource,
+    }
+    try:
+        response = ctx.http.request(
+            "POST",
+            f"{_LOGIN_BASE}/{tenant}/oauth2/token",
+            data=body,
+            idempotent=False,
+        )
+    except ApiError as exc:
+        if exc.status_code == 400:
+            detail = f"{exc.code}: {exc.message}" if exc.code else exc.message
+            raise AuthError(f"Failed to get access token: {detail}") from exc
+        raise
+    try:
+        token = response.json()
+    except ValueError as exc:
+        raise AuthError("Access token endpoint returned invalid JSON.") from exc
+    if not isinstance(token, dict):
+        raise AuthError("Access token endpoint returned an unexpected response.")
+    return token
+
+
 def handle_auth_seamless(ctx: Context, args: Any) -> None:
     _validate_flow(args)
     tenant = args.tenant.strip()
@@ -107,14 +234,12 @@ def handle_auth_seamless(ctx: Context, args: Any) -> None:
     try:
         from seamlesspass.utils.exceptions import UsageError as SeamlessUsageError
         from seamlesspass.utils.kerberos import KerberosHelper
-        from seamlesspass.utils.microsoft365 import Microsoft365Helper
     except ImportError as exc:
         raise AuthError(
             "Seamless SSO support requires the 'seamlesspass' package. "
             "Install it with `pip install -r requirements.txt`."
         ) from exc
 
-    warnings.filterwarnings("ignore", message="Unverified HTTPS request")
     capture = _LogCapture()
     logger = logging.getLogger("SeamlessPass")
     logger.handlers.clear()
@@ -128,16 +253,6 @@ def handle_auth_seamless(ctx: Context, args: Any) -> None:
         domain = domain or "dummy.lab"
         username = username or "dummy_user"
     options = types.SimpleNamespace(
-        tenant=tenant,
-        resource=resource,
-        client_id=client,
-        proxies=(
-            {"http": ctx.settings.proxy, "https": ctx.settings.proxy}
-            if ctx.settings.proxy
-            else None
-        ),
-        user_agent=getattr(args, "user_agent", None),
-        ignore_sso_check=args.ignore_sso_check,
         domain=domain,
         dc_host=args.dc_host,
         username=username,
@@ -154,8 +269,7 @@ def handle_auth_seamless(ctx: Context, args: Any) -> None:
         adssoacc_aes=args.adssoacc_aes,
     )
 
-    m365 = Microsoft365Helper.from_options(options)
-    if not args.ignore_sso_check and not m365.check_seamless_sso():
+    if not args.ignore_sso_check and not _check_seamless_sso(ctx, tenant):
         raise AuthError(
             "Seamless SSO is not enabled for this tenant. "
             "Use --ignore-sso-check to proceed anyway."
@@ -178,7 +292,10 @@ def handle_auth_seamless(ctx: Context, args: Any) -> None:
     try:
         spnego = KerberosHelper.tgs_to_spnego(tgs)
         kerberos_ticket = base64.b64encode(spnego).decode()
-        token = m365.get_access_token_with_kerberos_ticket(kerberos_ticket)
+        dsso_token = _get_dsso_token(ctx, tenant, kerberos_ticket)
+        token = _get_access_token(ctx, tenant, client, resource, dsso_token)
+    except AuthError:
+        raise
     except Exception as exc:
         raise AuthError(
             f"Seamless SSO token exchange failed: {exc}{_log_detail(capture.messages)}"

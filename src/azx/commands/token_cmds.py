@@ -585,7 +585,7 @@ def handle_delete(ctx: Context, args: Any) -> None:
 
 def handle_export(ctx: Context, args: Any) -> None:
     record = ctx.store.get(args.name)
-    target = Path(args.tokenfile).expanduser()
+    target = ctx.store.validate_export_target(Path(args.tokenfile))
     if (
         ctx.settings.output is not None
         and target.resolve() == ctx.settings.output.resolve()

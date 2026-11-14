@@ -1,76 +1,39 @@
-"""HTTP transport with retries, redacted debugging, and API errors."""
+"""HTTP transport with retries, debugging, and API errors."""
 
 from __future__ import annotations
 
 import json
+import math
 import time
 from collections.abc import Mapping
 from datetime import UTC, datetime
 from email.utils import parsedate_to_datetime
 from typing import Any
-from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
+from urllib.parse import urlencode
 
 import httpx
 
 from .config import Settings
 from .console import Output
 from .errors import ApiError, AzxError, UsageError
-from .util import deep_redact, is_sensitive_key
 
 _MAX_ATTEMPTS = 4
 _RETRY_STATUSES = {429, 500, 502, 503, 504}
 
 
-def _redacted_headers(headers: Mapping[str, str]) -> dict[str, str]:
-    return {
-        key: ("<redacted>" if is_sensitive_key(key) else value)
-        for key, value in headers.items()
-    }
-
-
-def _redacted_url(url: str) -> str:
-    parsed = urlsplit(url)
-    query = parse_qsl(parsed.query, keep_blank_values=True)
-    if not query:
-        return url
-    redacted = urlencode(
-        [
-            (
-                key,
-                "<redacted>" if is_sensitive_key(key) else value,
-            )
-            for key, value in query
-        ],
-        doseq=True,
-    )
-    return urlunsplit(
-        (parsed.scheme, parsed.netloc, parsed.path, redacted, parsed.fragment)
-    )
-
-
-def _redacted_form(data: Any) -> Any:
-    if data is None:
-        return None
+def _format_debug_data(data: Any) -> str:
     if isinstance(data, Mapping):
-        return {
-            key: ("<redacted>" if is_sensitive_key(str(key)) else value)
-            for key, value in data.items()
-        }
-    if isinstance(data, str):
-        pairs = parse_qsl(data, keep_blank_values=True)
-        if pairs:
-            return {
-                key: ("<redacted>" if is_sensitive_key(key) else value)
-                for key, value in pairs
-            }
-    return data
+        return urlencode(data, doseq=True)
+    if isinstance(data, bytes):
+        return data.decode("utf-8", "replace")
+    return str(data)
 
 
 def _response_body_for_debug(response: httpx.Response) -> str:
     content_type = response.headers.get("content-type", "")
     if "json" in content_type:
         try:
-            value = deep_redact(response.json())
+            value = response.json()
             return json.dumps(value, indent=2, ensure_ascii=False)
         except (ValueError, json.JSONDecodeError):
             pass
@@ -85,7 +48,7 @@ def _retry_delay(response: httpx.Response | None, attempt: int) -> float:
         value = response.headers.get("retry-after")
         if value:
             try:
-                return min(float(value), 30.0)
+                delay = float(value)
             except ValueError:
                 try:
                     when = parsedate_to_datetime(value)
@@ -95,6 +58,9 @@ def _retry_delay(response: httpx.Response | None, attempt: int) -> float:
                     return max(0.0, min(delta, 30.0))
                 except (TypeError, ValueError):
                     pass
+            else:
+                if math.isfinite(delay):
+                    return max(0.0, min(delay, 30.0))
     return min(1.0 * (2**attempt), 30.0)
 
 
@@ -187,14 +153,14 @@ class HttpClient:
     ) -> None:
         if not self.settings.debug_http:
             return
-        self.console.debug(f"> {method} {_redacted_url(url)}")
-        for key, value in _redacted_headers(headers).items():
+        self.console.debug(f"> {method} {url}")
+        for key, value in headers.items():
             self.console.debug(f"> {key}: {value}")
         if data is not None:
-            self.console.debug(f"> {urlencode(_redacted_form(data), doseq=True)}")
+            self.console.debug("> " + _format_debug_data(data))
         elif json_body is not None:
             self.console.debug(
-                "> " + json.dumps(deep_redact(json_body), indent=2, ensure_ascii=False)
+                "> " + json.dumps(json_body, indent=2, ensure_ascii=False)
             )
         self.console.debug(">")
 
@@ -202,7 +168,7 @@ class HttpClient:
         if not self.settings.debug_http:
             return
         self.console.debug(f"< {response.status_code} {response.reason_phrase}")
-        for key, value in _redacted_headers(response.headers).items():
+        for key, value in response.headers.items():
             self.console.debug(f"< {key}: {value}")
         body = _response_body_for_debug(response)
         if body:
@@ -248,12 +214,11 @@ class HttpClient:
 
             self._debug_response(response)
             if response.status_code in _RETRY_STATUSES:
-                # Retry transient 5xx only for idempotent methods so a
-                # mutation is never duplicated by the retry loop.
+                # Retry only idempotent requests so a mutation is never
+                # duplicated by the retry loop.
+                retry_429 = response.status_code == 429 and idempotent
                 retry_5xx = 500 <= response.status_code < 600 and idempotent
-                if (
-                    response.status_code == 429 or retry_5xx
-                ) and attempt < _MAX_ATTEMPTS - 1:
+                if (retry_429 or retry_5xx) and attempt < _MAX_ATTEMPTS - 1:
                     delay = _retry_delay(response, attempt)
                     if self.settings.debug_http:
                         self.console.debug(f"... retrying after {delay:.1f}s")

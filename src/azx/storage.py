@@ -120,7 +120,12 @@ class TokenStore:
             raise UsageError(
                 f"Token '{name}' already exists. Use --force to overwrite it."
             )
-        _atomic_write(path, json.dumps(raw, indent=2, ensure_ascii=False) + "\n")
+        try:
+            _atomic_write(path, json.dumps(raw, indent=2, ensure_ascii=False) + "\n")
+        except OSError as exc:
+            raise TokenError(
+                f"Cannot write token {name}: {exc.strerror or exc}"
+            ) from exc
         return path
 
     def delete(self, name: str) -> bool:
@@ -158,7 +163,10 @@ class TokenStore:
         self.ensure()
         if not self.exists(name):
             raise TokenError(f"Token not found: {name}")
-        _atomic_write(self.directory / "active", name + "\n")
+        try:
+            _atomic_write(self.directory / "active", name + "\n")
+        except OSError as exc:
+            raise TokenError(f"Cannot set active token: {exc.strerror or exc}") from exc
 
     def clear_active(self) -> None:
         try:
@@ -168,13 +176,25 @@ class TokenStore:
                 f"Cannot clear the active token: {exc.strerror or exc}"
             ) from exc
 
-    def export(self, record: TokenRecord, path: Path) -> Path:
+    def validate_export_target(self, path: Path) -> Path:
         target = path.expanduser()
-        protected = {(self.directory / "active").resolve()}
-        if target.resolve() in protected:
+        try:
+            resolved = target.resolve()
+            directory = self.directory.resolve()
+        except (OSError, RuntimeError) as exc:
             raise UsageError(
-                "Refusing to overwrite token store metadata with a token export."
+                f"Cannot resolve token export path {target}: {exc}"
+            ) from exc
+        if resolved.parent == directory and (
+            resolved.name == "active" or resolved.name.endswith(TOKEN_SUFFIX)
+        ):
+            raise UsageError(
+                f"Refusing to overwrite token store file {target} with a token export."
             )
+        return target
+
+    def export(self, record: TokenRecord, path: Path) -> Path:
+        target = self.validate_export_target(path)
         if target.parent and not target.parent.is_dir():
             raise UsageError(
                 f"Cannot write token export: directory {target.parent} does not exist."
