@@ -33,7 +33,7 @@ _MIN_WIDTHS = [4, 8, 6, 3, 3, 6, 10, 7]
 _HELP_LINES = [
     "AZX token selector",
     "",
-    "Up / Down      Move",
+    "Up/Down, j/k   Move",
     "/              Filter",
     "Tab            Toggle details",
     "d              Delete current token",
@@ -254,7 +254,7 @@ class _Selector:
             (
                 "fg:ansibrightblack",
                 (
-                    "Up/Down move  / filter  Tab details  d delete  "
+                    "Up/Down or j/k move  / filter  Tab details  d delete  "
                     "Enter select  Esc cancel  ? help  q quit"
                 ),
             )
@@ -295,6 +295,34 @@ class _Selector:
                 close_help()
             else:
                 self._move(1)
+            event.app.invalidate()
+
+        @bindings.add("j")
+        def _down_vim(event: Any) -> None:
+            if self.pending_delete:
+                event.app.invalidate()
+                return
+            if self.filtering:
+                self.filter_text += "j"
+                self._recompute()
+            elif self.help:
+                close_help()
+            else:
+                self._move(1)
+            event.app.invalidate()
+
+        @bindings.add("k")
+        def _up_vim(event: Any) -> None:
+            if self.pending_delete:
+                event.app.invalidate()
+                return
+            if self.filtering:
+                self.filter_text += "k"
+                self._recompute()
+            elif self.help:
+                close_help()
+            else:
+                self._move(-1)
             event.app.invalidate()
 
         @bindings.add("pageup")

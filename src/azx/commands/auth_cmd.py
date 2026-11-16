@@ -10,6 +10,7 @@ from ..aliases import resolve_client, resolve_resource
 from ..context import Context
 from ..errors import ApiError, AuthError, UsageError
 from ..jwt import decode_jwt
+from ..model import TokenRecord
 from ..tokenmeta import build_record, default_token_name
 from ..util import format_expiry, validate_token_name
 
@@ -129,6 +130,20 @@ def handle_auth_app(ctx: Context, args: Any) -> None:
         record["expiresOn"] = format_expiry(expires_at)
         record["expiresIn"] = seconds
 
-    ctx.store.save(record, name, force=args.force)
+    path = ctx.store.save(record, name, force=args.force)
     ctx.store.set_active(name)
-    ctx.console.token_line(name)
+    updated = TokenRecord(raw=record, name=name, path=path)
+    ctx.console.line(f"Authenticated: {name}", style="bold green")
+    display = str(updated.claims.get("app_displayname") or "").strip()
+    client_id = updated.client_id or client
+    client_value = (
+        f"{display} ({client_id})" if display and display != client_id else client_id
+    )
+    ctx.console.kv("Client", client_value)
+    ctx.console.kv(
+        "Service principal object ID",
+        updated.service_principal_id or "-",
+    )
+    ctx.console.kv("Audience", updated.audience_text)
+    ctx.console.kv("Expires", updated.expires_display)
+    ctx.console.kv("File", updated.path or "-")

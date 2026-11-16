@@ -202,6 +202,7 @@ class Output:
         rows: list[list[Any]],
         *,
         title: str | None = None,
+        fold_columns: set[int] | None = None,
     ) -> None:
         table = Table(
             title=title,
@@ -212,8 +213,13 @@ class Output:
             border_style=None if self.plain else "bright_black",
             padding=(0, 1),
         )
-        for header in headers:
-            table.add_column(Text(header))
+        for index, header in enumerate(headers):
+            options = (
+                {"overflow": "fold"}
+                if fold_columns is not None and index in fold_columns
+                else {}
+            )
+            table.add_column(Text(header), **options)
         for row in rows:
             table.add_row(*(Text(_cell(value)) for value in row))
         self.out.print(

@@ -126,13 +126,15 @@ def handle_user_owned(ctx: Context, args: Any) -> None:
         ctx.console.line("No owned objects found.")
         return
     ctx.console.table(
-        ["NAME", "TYPE", "ID"],
+        ["NAME", "TYPE", "APP ID", "OBJECT ID"],
         [
             [
                 item.get("displayName") or item.get("appId") or item.get("id", "-"),
                 odata_type(item.get("@odata.type")),
+                item.get("appId") or "-",
                 item.get("id", "-"),
             ]
             for item in objects
         ],
+        fold_columns={2, 3},
     )

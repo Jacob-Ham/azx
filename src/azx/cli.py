@@ -11,25 +11,25 @@ from typing import Any
 
 from . import __version__
 from .commands.apps import (
+    handle_app_roles as app_roles,
     handle_create as app_create,
     handle_delete as app_delete,
     handle_get as app_get,
     handle_list as app_list,
     handle_lock as app_lock,
-    handle_owned_by as app_owned_by,
     handle_owner_list as app_owner_list,
     handle_secret_add as app_secret_add,
     handle_secret_list as app_secret_list,
     handle_secret_remove as app_secret_remove,
-    handle_sp_create as app_sp_create,
-    handle_sp_delete as app_sp_delete,
-    handle_sp_get as app_sp_get,
-    handle_sp_list as app_sp_list,
-    handle_sp_owned_by as app_sp_owned_by,
-    handle_sp_owner_list as app_sp_owner_list,
-    handle_sp_secret_add as app_sp_secret_add,
-    handle_sp_secret_list as app_sp_secret_list,
-    handle_sp_secret_remove as app_sp_secret_remove,
+    handle_sp_create as sp_create,
+    handle_sp_delete as sp_delete,
+    handle_sp_get as sp_get,
+    handle_sp_list as sp_list,
+    handle_sp_owner_list as sp_owner_list,
+    handle_sp_roles as sp_roles,
+    handle_sp_secret_add as sp_secret_add,
+    handle_sp_secret_list as sp_secret_list,
+    handle_sp_secret_remove as sp_secret_remove,
     handle_unlock as app_unlock,
 )
 from .commands.auth_cmd import handle_auth_app
@@ -76,7 +76,7 @@ from .commands.roles import (
     handle_assign as role_assign,
     handle_list as role_list,
     handle_list_members as role_list_members,
-    handle_remove as role_remove,
+    handle_unassign as role_unassign,
 )
 from .commands.seamless import handle_auth_seamless
 from .commands.taps import (
@@ -249,6 +249,9 @@ COMMON_SUB = _common_parser(visible=False)
 
 USER_HELP = "User object ID (GUID) or UPN."
 USER_ID_HELP = "User object ID (GUID)."
+PRINCIPAL_ID_HELP = (
+    "User/group object ID, or service principal object ID or client ID (GUID)."
+)
 GROUP_HELP = "Group object ID (GUID)."
 MEMBER_HELP = "Directory object ID (GUID) of the user, group, or service principal."
 CLIENT_ID_HELP = "Application client ID (appId GUID; object IDs are not accepted)."
@@ -711,7 +714,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     method_remove_parser.set_defaults(func=method_remove)
 
-    role = _command(subparsers, "role", "Entra directory role commands.")
+    role = _command(subparsers, "role", "Directory roles and app permissions.")
     role_sub = role.add_subparsers(
         dest="role_command", required=True, metavar="command"
     )
@@ -727,27 +730,59 @@ def build_parser() -> argparse.ArgumentParser:
     )
     role_list_members_parser.set_defaults(func=role_list_members)
     role_assign_parser = _command(
-        role_sub, "assign", "Assign a permanent directory role."
+        role_sub,
+        "assign",
+        "Assign a permanent directory role or an application permission.",
     )
-    role_assign_parser.add_argument("user", metavar="USER", help=USER_ID_HELP)
     role_assign_parser.add_argument(
+        "principal",
+        metavar="PRINCIPAL_ID",
+        help=PRINCIPAL_ID_HELP,
+    )
+    role_assign_mode = role_assign_parser.add_mutually_exclusive_group(required=True)
+    role_assign_mode.add_argument(
         "--role",
-        required=True,
-        metavar="ROLE",
-        help="Built-in directory role name or role template ID.",
+        metavar="ROLE_TEMPLATE_ID",
+        help="Directory role template/definition ID (GUID).",
+    )
+    role_assign_mode.add_argument(
+        "--api-permission",
+        metavar="PERMISSION",
+        help=(
+            "Application permission value, display name, or app role ID on "
+            "Microsoft Graph; PRINCIPAL_ID may be a service principal object "
+            "ID or client ID."
+        ),
     )
     role_assign_parser.set_defaults(func=role_assign)
-    role_remove_parser = _command(
-        role_sub, "remove", "Remove a directory role assignment."
+    role_unassign_parser = _command(
+        role_sub,
+        "unassign",
+        "Unassign a directory role or application permission.",
     )
-    role_remove_parser.add_argument("user", metavar="USER", help=USER_ID_HELP)
-    role_remove_parser.add_argument(
+    role_unassign_parser.add_argument(
+        "principal",
+        metavar="PRINCIPAL_ID",
+        help=PRINCIPAL_ID_HELP,
+    )
+    role_unassign_mode = role_unassign_parser.add_mutually_exclusive_group(
+        required=True
+    )
+    role_unassign_mode.add_argument(
         "--role",
-        required=True,
-        metavar="ROLE",
-        help="Built-in directory role name or role template ID.",
+        metavar="ROLE_TEMPLATE_ID",
+        help="Directory role template/definition ID (GUID).",
     )
-    role_remove_parser.set_defaults(func=role_remove)
+    role_unassign_mode.add_argument(
+        "--api-permission",
+        metavar="PERMISSION",
+        help=(
+            "Application permission value, display name, or app role ID on "
+            "Microsoft Graph; PRINCIPAL_ID may be a service principal object "
+            "ID or client ID."
+        ),
+    )
+    role_unassign_parser.set_defaults(func=role_unassign)
 
     azure = _command(subparsers, "azure", "Azure Resource Manager commands.")
     azure_sub = azure.add_subparsers(
@@ -829,6 +864,18 @@ def build_parser() -> argparse.ArgumentParser:
         help=CLIENT_ID_HELP,
     )
     app_get_parser.set_defaults(func=app_get)
+    app_roles_parser = _command(
+        app_sub,
+        "roles",
+        "List directory role assignments and application permissions for an "
+        "application's service principal.",
+    )
+    app_roles_parser.add_argument(
+        "client_id",
+        metavar="CLIENT_ID",
+        help=CLIENT_ID_HELP,
+    )
+    app_roles_parser.set_defaults(func=app_roles)
     app_delete_parser = _command(
         app_sub,
         "delete",
@@ -943,153 +990,124 @@ def build_parser() -> argparse.ArgumentParser:
         help=CLIENT_ID_HELP,
     )
     app_owner_list_parser.set_defaults(func=app_owner_list)
-    app_owned_by_parser = _command(
-        app_sub, "owned-by", "List applications owned by a principal."
-    )
-    app_owned_by_parser.add_argument(
-        "principal",
-        metavar="PRINCIPAL",
-        help=(
-            "User UPN, user object ID, or service principal object ID; "
-            "GUIDs need --type."
-        ),
-    )
-    app_owned_by_parser.add_argument(
-        "--type",
-        dest="principal_type",
-        choices=["user", "service-principal"],
-        help="Principal kind; required with a GUID, unnecessary with a UPN.",
-    )
-    app_owned_by_parser.set_defaults(func=app_owned_by)
-
-    app_sp = _command(app_sub, "sp", "Service principal commands.")
-    app_sp_sub = app_sp.add_subparsers(
-        dest="app_sp_command", required=True, metavar="command"
-    )
-    app_sp_list_parser = _command(app_sp_sub, "list", "List service principals.")
-    app_sp_list_parser.set_defaults(func=app_sp_list)
-    app_sp_get_parser = _command(
-        app_sp_sub, "get", "Get a service principal by client ID."
-    )
-    app_sp_get_parser.add_argument(
+    sp = _command(subparsers, "sp", "Service principal commands.")
+    sp_sub = sp.add_subparsers(dest="sp_command", required=True, metavar="command")
+    sp_list_parser = _command(sp_sub, "list", "List service principals.")
+    sp_list_parser.set_defaults(func=sp_list)
+    sp_get_parser = _command(sp_sub, "get", "Get a service principal by client ID.")
+    sp_get_parser.add_argument(
         "client_id",
         metavar="CLIENT_ID",
         help=SP_CLIENT_ID_HELP,
     )
-    app_sp_get_parser.set_defaults(func=app_sp_get)
-    app_sp_create_parser = _command(
-        app_sp_sub,
+    sp_get_parser.set_defaults(func=sp_get)
+    sp_roles_parser = _command(
+        sp_sub,
+        "roles",
+        "List directory role assignments and application permissions for a "
+        "service principal.",
+    )
+    sp_roles_parser.add_argument(
+        "client_id",
+        metavar="CLIENT_ID",
+        help=SP_CLIENT_ID_HELP,
+    )
+    sp_roles_parser.set_defaults(func=sp_roles)
+    sp_create_parser = _command(
+        sp_sub,
         "create",
         "Create a service principal from an application registration.",
     )
-    app_sp_create_parser.add_argument(
+    sp_create_parser.add_argument(
         "client_id",
         metavar="CLIENT_ID",
         help=SP_CLIENT_ID_HELP,
     )
-    app_sp_create_parser.add_argument(
+    sp_create_parser.add_argument(
         "--display-name",
         metavar="NAME",
         help="Optional service principal display name.",
     )
-    app_sp_create_parser.set_defaults(func=app_sp_create)
-    app_sp_delete_parser = _command(
-        app_sp_sub, "delete", "Delete a service principal by client ID."
+    sp_create_parser.set_defaults(func=sp_create)
+    sp_delete_parser = _command(
+        sp_sub, "delete", "Delete a service principal by client ID."
     )
-    app_sp_delete_parser.add_argument(
+    sp_delete_parser.add_argument(
         "client_id",
         metavar="CLIENT_ID",
         help=SP_CLIENT_ID_HELP,
     )
-    app_sp_delete_parser.set_defaults(func=app_sp_delete)
-    app_sp_secret = _command(app_sp_sub, "secret", "Service principal secrets.")
-    app_sp_secret_sub = app_sp_secret.add_subparsers(
-        dest="app_sp_secret_command", required=True, metavar="command"
+    sp_delete_parser.set_defaults(func=sp_delete)
+    sp_secret = _command(sp_sub, "secret", "Service principal secrets.")
+    sp_secret_sub = sp_secret.add_subparsers(
+        dest="sp_secret_command", required=True, metavar="command"
     )
-    app_sp_secret_add_parser = _command(
-        app_sp_secret_sub,
+    sp_secret_add_parser = _command(
+        sp_secret_sub,
         "add",
         "Add a secret to a service principal by client ID.",
     )
-    app_sp_secret_add_parser.add_argument(
+    sp_secret_add_parser.add_argument(
         "client_id",
         metavar="CLIENT_ID",
         help=SP_CLIENT_ID_HELP,
     )
-    app_sp_secret_add_parser.add_argument(
+    sp_secret_add_parser.add_argument(
         "--secret-name",
         required=True,
         metavar="NAME",
         help="Secret display name.",
     )
-    app_sp_secret_add_parser.add_argument(
+    sp_secret_add_parser.add_argument(
         "--lifetime",
         type=int,
         default=365,
         metavar="DAYS",
         help="Secret lifetime in days (default: 365).",
     )
-    app_sp_secret_add_parser.set_defaults(func=app_sp_secret_add)
-    app_sp_secret_remove_parser = _command(
-        app_sp_secret_sub,
+    sp_secret_add_parser.set_defaults(func=sp_secret_add)
+    sp_secret_remove_parser = _command(
+        sp_secret_sub,
         "remove",
         "Remove a secret from a service principal by client ID.",
     )
-    app_sp_secret_remove_parser.add_argument(
+    sp_secret_remove_parser.add_argument(
         "client_id",
         metavar="CLIENT_ID",
         help=SP_CLIENT_ID_HELP,
     )
-    app_sp_secret_remove_parser.add_argument(
+    sp_secret_remove_parser.add_argument(
         "--key-id",
         dest="key_id",
         required=True,
         metavar="KEY_ID",
         help="Secret key ID (GUID).",
     )
-    app_sp_secret_remove_parser.set_defaults(func=app_sp_secret_remove)
-    app_sp_secret_list_parser = _command(
-        app_sp_secret_sub,
+    sp_secret_remove_parser.set_defaults(func=sp_secret_remove)
+    sp_secret_list_parser = _command(
+        sp_secret_sub,
         "list",
         "List secrets on a service principal by client ID.",
     )
-    app_sp_secret_list_parser.add_argument(
+    sp_secret_list_parser.add_argument(
         "client_id",
         metavar="CLIENT_ID",
         help=SP_CLIENT_ID_HELP,
     )
-    app_sp_secret_list_parser.set_defaults(func=app_sp_secret_list)
-    app_sp_owner = _command(app_sp_sub, "owner", "Service principal owners.")
-    app_sp_owner_sub = app_sp_owner.add_subparsers(
-        dest="app_sp_owner_command", required=True, metavar="command"
+    sp_secret_list_parser.set_defaults(func=sp_secret_list)
+    sp_owner = _command(sp_sub, "owner", "Service principal owners.")
+    sp_owner_sub = sp_owner.add_subparsers(
+        dest="sp_owner_command", required=True, metavar="command"
     )
-    app_sp_owner_list_parser = _command(
-        app_sp_owner_sub, "list", "List service principal owners by client ID."
+    sp_owner_list_parser = _command(
+        sp_owner_sub, "list", "List service principal owners by client ID."
     )
-    app_sp_owner_list_parser.add_argument(
+    sp_owner_list_parser.add_argument(
         "client_id",
         metavar="CLIENT_ID",
         help=SP_CLIENT_ID_HELP,
     )
-    app_sp_owner_list_parser.set_defaults(func=app_sp_owner_list)
-    app_sp_owned_by_parser = _command(
-        app_sp_sub, "owned-by", "List service principals owned by a principal."
-    )
-    app_sp_owned_by_parser.add_argument(
-        "principal",
-        metavar="PRINCIPAL",
-        help=(
-            "User UPN, user object ID, or service principal object ID; "
-            "GUIDs need --type."
-        ),
-    )
-    app_sp_owned_by_parser.add_argument(
-        "--type",
-        dest="principal_type",
-        choices=["user", "service-principal"],
-        help="Principal kind; required with a GUID, unnecessary with a UPN.",
-    )
-    app_sp_owned_by_parser.set_defaults(func=app_sp_owned_by)
+    sp_owner_list_parser.set_defaults(func=sp_owner_list)
 
     myapps = _command(
         subparsers,

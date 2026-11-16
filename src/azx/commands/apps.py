@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from typing import Any
 from urllib.parse import quote
 
 from ..api import GraphClient
+from ..approlecache import resolve_permission_names
 from ..context import Context
 from ..errors import ApiError, AzxError, UsageError
 from ..util import format_api_datetime, format_list, is_guid, yes_no
@@ -24,6 +27,16 @@ SP_SELECT = (
     "appOwnerOrganizationId"
 )
 SP_SECRET_SELECT = "id,appId,displayName,passwordCredentials"
+ASSIGNED_ROLE_SELECT = "id,resourceId,resourceDisplayName,appRoleId"
+APP_ROLE_CACHE_FILE = "app_roles.json"
+
+
+@dataclass(slots=True)
+class _PrincipalRoleData:
+    service_principal: dict[str, Any]
+    directory_roles: list[dict[str, Any]]
+    application_permissions: list[dict[str, Any]]
+    permission_names: dict[tuple[str, str], str] = field(default_factory=dict)
 
 
 def _require_client_id(reference: str) -> str:
@@ -70,6 +83,140 @@ def resolve_application(graph: GraphClient, client_id: str) -> dict[str, Any]:
             f"Application not found for client ID {text}. Use the appId "
             "(not the object ID)."
         ) from exc
+
+
+def _load_principal_roles(
+    graph: GraphClient,
+    client_id: str,
+    *,
+    cache_path: Path | None = None,
+    tenant_id: str | None = None,
+) -> _PrincipalRoleData:
+    text = _require_client_id(client_id)
+    try:
+        service_principal = graph.get(
+            _sp_path(text),
+            params={
+                "$select": "id,appId,displayName,appDisplayName",
+                "$expand": (
+                    f"appRoleAssignments($select={ASSIGNED_ROLE_SELECT};$top=999)"
+                ),
+            },
+        )
+    except ApiError as exc:
+        if exc.status_code != 404:
+            raise
+        raise UsageError(
+            f"Service principal not found for client ID {text}. Use the appId "
+            "of an application with a service principal."
+        ) from exc
+    service_principal_id = str(service_principal.get("id") or "").strip()
+    if not service_principal_id:
+        raise AzxError("Service principal response did not include its object ID.")
+    directory_roles = graph.get_all(
+        "/roleManagement/directory/roleAssignments",
+        params={
+            "$filter": f"principalId eq '{service_principal_id}'",
+            "$expand": "roleDefinition($select=id,displayName,templateId)",
+            "$top": "999",
+        },
+    )
+    application_permissions = service_principal.get("appRoleAssignments")
+    if not isinstance(application_permissions, list):
+        application_permissions = []
+    permission_names = {}
+    if cache_path is not None:
+        permission_names = resolve_permission_names(
+            graph,
+            cache_path,
+            tenant_id,
+            application_permissions,
+        )
+    return _PrincipalRoleData(
+        service_principal=service_principal,
+        directory_roles=directory_roles,
+        application_permissions=application_permissions,
+        permission_names=permission_names,
+    )
+
+
+def _print_principal_roles(
+    ctx: Context,
+    data: _PrincipalRoleData,
+    *,
+    subject: str,
+) -> None:
+    service_principal = data.service_principal
+    if subject == "Application":
+        name = service_principal.get("appDisplayName") or service_principal.get(
+            "displayName"
+        )
+    else:
+        name = service_principal.get("displayName")
+    ctx.console.kv(subject, name or "-")
+    ctx.console.kv("Client ID", service_principal.get("appId") or "-")
+    ctx.console.kv("Service principal object ID", service_principal.get("id") or "-")
+
+    def section(title: str) -> None:
+        ctx.console.blank()
+        ctx.console.heading(title)
+
+    section("Directory roles")
+    if data.directory_roles:
+        rows = []
+        for assignment in data.directory_roles:
+            definition = assignment.get("roleDefinition")
+            if not isinstance(definition, dict):
+                definition = {}
+            scope = assignment.get("directoryScopeId") or "-"
+            if scope == f"/{service_principal.get('id')}":
+                scope = "This service principal"
+            rows.append(
+                [
+                    definition.get("displayName")
+                    or assignment.get("roleDefinitionId")
+                    or "-",
+                    definition.get("templateId")
+                    or assignment.get("roleDefinitionId")
+                    or "-",
+                    scope,
+                    assignment.get("id") or "-",
+                ]
+            )
+        ctx.console.table(
+            ["ROLE", "TEMPLATE ID", "SCOPE", "ASSIGNMENT ID"],
+            rows,
+        )
+    else:
+        ctx.console.line("No directory roles.")
+
+    section("Application permissions")
+    if data.application_permissions:
+        rows = []
+        for permission in data.application_permissions:
+            resource_id = str(permission.get("resourceId") or "")
+            role_id = str(permission.get("appRoleId") or "")
+            rows.append(
+                [
+                    permission.get("resourceDisplayName") or resource_id or "-",
+                    data.permission_names.get((resource_id, role_id)) or role_id or "-",
+                ]
+            )
+        ctx.console.table(["RESOURCE", "PERMISSION"], rows, fold_columns={1})
+    else:
+        ctx.console.line("No application permissions.")
+
+
+def handle_app_roles(ctx: Context, args: Any) -> None:
+    graph = ctx.graph()
+    tenant_id = ctx.current_token.tenant_id if ctx.current_token else None
+    data = _load_principal_roles(
+        graph,
+        args.client_id,
+        cache_path=ctx.settings.tokens_dir / APP_ROLE_CACHE_FILE,
+        tenant_id=tenant_id,
+    )
+    _print_principal_roles(ctx, data, subject="Application")
 
 
 def handle_create(ctx: Context, args: Any) -> None:
@@ -406,53 +553,6 @@ def handle_owner_list(ctx: Context, args: Any) -> None:
     _print_owners(ctx, graph.get_all(_app_path(client_id, "/owners")))
 
 
-def _principal_path(reference: str, principal_type: str | None) -> tuple[str, str]:
-    ref = (reference or "").strip()
-    if not ref:
-        raise UsageError("Principal is required.")
-    if "@" in ref:
-        if principal_type == "service-principal":
-            raise UsageError(
-                "A UPN identifies a user; --type service-principal requires "
-                "an object ID."
-            )
-        return "users", quote(ref, safe="@")
-    if not is_guid(ref):
-        raise UsageError(
-            "Principal must be a user UPN, a user object ID, or a service "
-            "principal object ID (GUID)."
-        )
-    if principal_type is None:
-        raise UsageError(
-            "--type is required with an object ID: user or service-principal."
-        )
-    collection = "users" if principal_type == "user" else "servicePrincipals"
-    return collection, quote(ref)
-
-
-def handle_owned_by(ctx: Context, args: Any) -> None:
-    graph = ctx.graph()
-    collection, principal_id = _principal_path(args.principal, args.principal_type)
-    applications = graph.get_all(
-        f"/{collection}/{principal_id}/ownedObjects/microsoft.graph.application",
-        params={"$select": "id,appId,displayName", "$top": "999"},
-    )
-    if not applications:
-        ctx.console.line("No owned applications found.")
-        return
-    ctx.console.table(
-        ["NAME", "CLIENT ID", "OBJECT ID"],
-        [
-            [
-                application.get("displayName", "-"),
-                application.get("appId", "-"),
-                application.get("id", "-"),
-            ]
-            for application in applications
-        ],
-    )
-
-
 def handle_sp_list(ctx: Context, args: Any) -> None:
     graph = ctx.graph()
     service_principals = graph.get_all(
@@ -515,6 +615,18 @@ def handle_sp_get(ctx: Context, args: Any) -> None:
     ctx.console.kv("Tags", format_list(service_principal.get("tags")))
 
 
+def handle_sp_roles(ctx: Context, args: Any) -> None:
+    graph = ctx.graph()
+    tenant_id = ctx.current_token.tenant_id if ctx.current_token else None
+    data = _load_principal_roles(
+        graph,
+        args.client_id,
+        cache_path=ctx.settings.tokens_dir / APP_ROLE_CACHE_FILE,
+        tenant_id=tenant_id,
+    )
+    _print_principal_roles(ctx, data, subject="Service principal")
+
+
 def handle_sp_create(ctx: Context, args: Any) -> None:
     graph = ctx.graph()
     client_id = _require_client_id(args.client_id)
@@ -575,33 +687,6 @@ def handle_sp_owner_list(ctx: Context, args: Any) -> None:
     graph = ctx.graph()
     client_id = _require_client_id(args.client_id)
     _print_owners(ctx, graph.get_all(_sp_path(client_id, "/owners")))
-
-
-def handle_sp_owned_by(ctx: Context, args: Any) -> None:
-    graph = ctx.graph()
-    collection, principal_id = _principal_path(args.principal, args.principal_type)
-    service_principals = graph.get_all(
-        f"/{collection}/{principal_id}/ownedObjects/microsoft.graph.servicePrincipal",
-        params={
-            "$select": "id,appId,displayName,servicePrincipalType",
-            "$top": "999",
-        },
-    )
-    if not service_principals:
-        ctx.console.line("No owned service principals found.")
-        return
-    ctx.console.table(
-        ["NAME", "TYPE", "CLIENT ID", "OBJECT ID"],
-        [
-            [
-                service_principal.get("displayName", "-"),
-                service_principal.get("servicePrincipalType") or "-",
-                service_principal.get("appId", "-"),
-                service_principal.get("id", "-"),
-            ]
-            for service_principal in service_principals
-        ],
-    )
 
 
 def handle_sp_secret_add(ctx: Context, args: Any) -> None:
