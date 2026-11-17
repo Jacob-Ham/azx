@@ -8,11 +8,7 @@ from datetime import datetime
 from typing import Any
 from urllib.parse import urlparse
 
-from .aliases import (
-    client_short_name,
-    is_arm_audience,
-    is_graph_audience,
-)
+from .aliases import client_short_name
 from .errors import TokenError, UsageError
 from .jwt import decode_jwt, strip_bearer
 from .util import (
@@ -329,14 +325,6 @@ def validate_import_consistency(
         and tenant.lower() != str(existing_tenant).lower()
     ):
         raise UsageError("Tenant does not match the token file's tenantId.")
-
-
-def audience_matches(audience: str | None, kind: str) -> bool:
-    if kind == "graph":
-        return is_graph_audience(audience)
-    if kind == "arm":
-        return is_arm_audience(audience)
-    return False
 
 
 def record_expiry(record: Mapping[str, Any]) -> datetime | None:

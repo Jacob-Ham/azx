@@ -13,9 +13,7 @@ from .common import odata_type, resolve_user, user_path_segment
 def handle_whoami(ctx: Context, args: Any) -> None:
     token = ctx.resolve_token()
     if not token.has_access_token:
-        raise TokenError(
-            f"Token '{token.name}' has no access token (refresh token only)."
-        )
+        raise TokenError(f"Token '{token.name}' has no access token.")
     claims = token.claims
     ctx.console.kv("Token", token.name)
     ctx.console.kv("Type", token.type)

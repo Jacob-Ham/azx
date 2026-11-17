@@ -60,10 +60,6 @@ class TokenRecord:
         return isinstance(value, str) and bool(value.strip())
 
     @property
-    def refresh_only(self) -> bool:
-        return self.has_refresh_token and not self.has_access_token
-
-    @property
     def access_token(self) -> str | None:
         value = self.raw.get("accessToken")
         return value if isinstance(value, str) and value.strip() else None
@@ -252,10 +248,7 @@ class TokenRecord:
             if collected is not None:
                 parts.append(f"Collected: {collected.strftime('%Y-%m-%d %H:%M')}")
         if not self.has_access_token:
-            if self.refresh_only:
-                parts.append("Access token: none (refresh token only)")
-            else:
-                parts.append("Access token: none")
+            parts.append("Access token: none")
         if self.scopes:
             parts.append(f"Scopes: {format_list(self.scopes)}")
         if self.roles:

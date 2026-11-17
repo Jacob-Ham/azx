@@ -79,6 +79,7 @@ _AUDIENCE_LABELS: dict[str, str] = {
     "00000002-0000-0ff1-ce00-000000000000": "Exchange Online",
     "https://management.core.windows.net": "ARM",
     "https://management.azure.com": "ARM",
+    "797f4846-ba00-4fd7-ba43-dac1f8f63013": "ARM",
     "https://outlook.office.com": "Outlook",
     "00000003-0000-0ff1-ce00-000000000000": "SharePoint",
     "urn:ms-drs:enterpriseregistration.windows.net": "Device Registration",
@@ -149,26 +150,6 @@ def resolve_resource(value: str) -> tuple[str, str]:
     else:
         target = _normalize_resource(target)
     return target, f"{target}/.default"
-
-
-def is_graph_audience(audience: str | None) -> bool:
-    if not audience:
-        return False
-    normalized = _normalize_audience(audience)
-    return normalized in {
-        "https://graph.microsoft.com",
-        "00000003-0000-0000-c000-000000000000",
-    }
-
-
-def is_arm_audience(audience: str | None) -> bool:
-    if not audience:
-        return False
-    normalized = _normalize_audience(audience)
-    return normalized in {
-        "https://management.core.windows.net",
-        "https://management.azure.com",
-    }
 
 
 def audience_label(audience: str | None) -> str:

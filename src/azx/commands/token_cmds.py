@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import quote
 
-from ..aliases import resolve_client
+from ..aliases import resolve_client, resolve_resource
 from ..context import Context
 from ..errors import ApiError, AuthError, TokenError, UsageError
 from ..jwt import decode_jwt
@@ -37,6 +37,7 @@ _LOGIN_BASES = {
 _KNOWN_RESOURCES = {
     "00000003-0000-0000-c000-000000000000": "https://graph.microsoft.com",
     "00000002-0000-0000-c000-000000000000": "https://graph.windows.net",
+    "797f4846-ba00-4fd7-ba43-dac1f8f63013": "https://management.core.windows.net",
 }
 
 _DISPLAYED_FIELDS = {
@@ -115,9 +116,7 @@ def _print_summary(ctx: Context, record: TokenRecord, path: Path) -> None:
     ctx.console.kv("Principal", record.principal_display)
     ctx.console.kv("Client", record.client_display)
     ctx.console.kv("Audience", record.audience_text)
-    if record.refresh_only:
-        ctx.console.kv("Access token", "none (refresh token only)")
-    elif not record.has_access_token:
+    if not record.has_access_token:
         ctx.console.kv("Access token", "none")
     ctx.console.kv("File", path)
 
@@ -189,7 +188,7 @@ def handle_import(ctx: Context, args: Any) -> None:
                 or not (tenant or raw.get("tenantId"))
             ):
                 raise UsageError(
-                    "A refresh-only token requires -c <client> and "
+                    "A token without an access token requires -c <client> and "
                     "-t <tenant>, or _clientId and tenantId in the file."
                 )
             if claims:
@@ -217,7 +216,7 @@ def handle_import(ctx: Context, args: Any) -> None:
             raise UsageError("--refresh-token must not be empty.")
         if refresh and not access and (not client or not tenant):
             raise UsageError(
-                "A refresh-only token requires -c <client> and -t <tenant>."
+                "A token without an access token requires -c <client> and -t <tenant>."
             )
         claims: dict[str, Any] = {}
         if access:
@@ -232,7 +231,8 @@ def handle_import(ctx: Context, args: Any) -> None:
             validate_token_name(name)
         else:
             raise UsageError(
-                "A name is required for a refresh-only token; pass -n <name>."
+                "A name is required for a token without an access token; "
+                "pass -n <name>."
             )
         record = build_record(
             access_token=access,
@@ -264,9 +264,7 @@ def handle_import(ctx: Context, args: Any) -> None:
             ctx.console.kv("Action", f"Import token '{name}'")
             ctx.console.kv("Principal", record.principal_display)
             ctx.console.kv("Audience", record.audience_text)
-            if record.refresh_only:
-                ctx.console.kv("Access token", "none (refresh token only)")
-            elif not record.has_access_token:
+            if not record.has_access_token:
                 ctx.console.kv("Access token", "none")
             ctx.console.kv("File", record.path)
         return
@@ -297,6 +295,9 @@ def _refresh_login_base(record: TokenRecord) -> str:
 def _refresh_form(
     record: TokenRecord,
     version: str,
+    *,
+    resource: str | None = None,
+    scope: str | None = None,
 ) -> tuple[dict[str, str], str, str]:
     client_id = record.client_id
     refresh_token = record.refresh_token
@@ -313,27 +314,33 @@ def _refresh_form(
         "refresh_token": refresh_token,
     }
     audience = record.audience
+    target = resource or audience
     if version == "v2":
-        scopes = [scope for scope in record.scopes if not scope.startswith("_")]
-        if not scopes and audience:
-            resource = _KNOWN_RESOURCES.get(audience.lower(), audience)
-            if "://" in resource:
-                scopes = [resource.rstrip("/") + "/.default"]
+        scopes = [item for item in record.scopes if not item.startswith("_")]
+        if not scopes and scope:
+            scopes = [scope]
+        if not scopes and target:
+            resolved = _KNOWN_RESOURCES.get(target.lower(), target)
+            if "://" in resolved:
+                scopes = [resolved.rstrip("/") + "/.default"]
         if not scopes:
             raise TokenError(
-                f"Token '{record.name}' has no refresh scope; cannot refresh it."
+                f"Token '{record.name}' has no refresh scope; pass "
+                "--resource to choose one."
             )
-        if "offline_access" not in {scope.casefold() for scope in scopes}:
+        if "offline_access" not in {item.casefold() for item in scopes}:
             scopes.append("offline_access")
-        scope = " ".join(scopes)
-        form["scope"] = scope
-        return form, "Scope", scope
+        value = " ".join(scopes)
+        form["scope"] = value
+        return form, "Scope", value
 
-    if not audience:
-        raise TokenError(f"Token '{record.name}' has no audience; cannot refresh it.")
-    resource = _KNOWN_RESOURCES.get(audience.lower(), audience)
-    form["resource"] = resource
-    return form, "Resource", resource
+    if not target:
+        raise TokenError(
+            f"Token '{record.name}' has no access token; pass --resource to choose one."
+        )
+    resolved = _KNOWN_RESOURCES.get(target.lower(), target)
+    form["resource"] = resolved
+    return form, "Resource", resolved
 
 
 def _refresh_expires_seconds(value: Any) -> int | None:
@@ -353,8 +360,19 @@ def handle_refresh(ctx: Context, args: Any) -> None:
     if not tenant:
         raise TokenError(f"Token '{name}' has no tenant ID; cannot refresh it.")
 
+    resource: str | None = None
+    scope: str | None = None
+    requested = getattr(args, "resource", None)
+    if requested:
+        resource, scope = resolve_resource(requested)
+
     version = _refresh_version(record)
-    form, parameter, value = _refresh_form(record, version)
+    form, parameter, value = _refresh_form(
+        record,
+        version,
+        resource=resource,
+        scope=scope,
+    )
     base = _refresh_login_base(record)
     endpoint = "oauth2/v2.0/token" if version == "v2" else "oauth2/token"
     url = f"{base}/{quote(tenant, safe='')}/{endpoint}"
@@ -536,10 +554,7 @@ def handle_show(ctx: Context, args: Any) -> None:
         for key, value in extra.items():
             ctx.console.kv(key, render_value(deep_redact(value)))
     if not record.has_access_token:
-        if record.refresh_only:
-            ctx.console.kv("Access token", "none (refresh token only)")
-        else:
-            ctx.console.kv("Access token", "none")
+        ctx.console.kv("Access token", "none")
         return
     claims = deep_redact(record.claims)
     if not claims:
@@ -552,7 +567,7 @@ def handle_show(ctx: Context, args: Any) -> None:
 
 
 def handle_select(ctx: Context, args: Any) -> None:
-    selected = ctx.select_token(all_tokens=True, activate=not ctx.dry_run)
+    selected = ctx.select_token(activate=not ctx.dry_run)
     if selected is None:
         raise TokenError("No token selected.")
     if ctx.dry_run:

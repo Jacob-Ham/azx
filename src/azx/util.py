@@ -28,6 +28,7 @@ _AUDIENCE_SLUGS = {
     "00000002-0000-0ff1-ce00-000000000000": "exchange",
     "https://management.core.windows.net": "arm",
     "https://management.azure.com": "arm",
+    "797f4846-ba00-4fd7-ba43-dac1f8f63013": "arm",
     "https://outlook.office.com": "outlook",
     "00000003-0000-0ff1-ce00-000000000000": "sharepoint",
     "urn:ms-drs:enterpriseregistration.windows.net": "devicereg",

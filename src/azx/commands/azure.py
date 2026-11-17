@@ -14,6 +14,8 @@ from .common import dry_run
 ROLE_API = "2022-04-01"
 SUBSCRIPTIONS_API = "2022-12-01"
 ELEVATE_API = "2015-07-01"
+UAA_ROLE_ID = "18d7d88d-d35e-4fb5-a5c3-7773c20a72d9"
+UAA_ROLE_NAME = "User Access Administrator"
 
 
 def _normalize_scope(value: str) -> str:
@@ -94,20 +96,54 @@ def handle_subscriptions(ctx: Context, args: Any) -> None:
     )
 
 
-def handle_elevate(ctx: Context, args: Any) -> None:
+def _current_principal(ctx: Context) -> str:
+    token = ctx.current_token
+    principal = token.principal_id if token else None
+    if not principal:
+        raise UsageError("The active token has no principal object ID.")
+    return principal
+
+
+def _uaa_assignments(
+    arm: ArmClient,
+    principal: str,
+) -> list[dict[str, Any]]:
+    assignments = arm.get_all(
+        "/providers/Microsoft.Authorization/roleAssignments",
+        params={
+            "api-version": ROLE_API,
+            "$filter": f"principalId eq '{principal}'",
+        },
+    )
+    matches = []
+    for assignment in assignments:
+        properties = assignment.get("properties")
+        if not isinstance(properties, dict):
+            continue
+        role_id = str(properties.get("roleDefinitionId") or "")
+        if role_id.rsplit("/", 1)[-1].casefold() != UAA_ROLE_ID.casefold():
+            continue
+        if str(properties.get("principalId") or "").casefold() != principal.casefold():
+            continue
+        matches.append(assignment)
+    return matches
+
+
+def handle_uaa_assign(ctx: Context, args: Any) -> None:
     arm = ctx.arm()
+    principal = _current_principal(ctx)
     if ctx.dry_run:
         dry_run(
             ctx,
-            action="Elevate tenant root access",
-            target="Tenant root",
+            action=f"Assign {UAA_ROLE_NAME} at tenant root",
+            target=f"{principal} -> /",
             payload={
                 "method": "POST",
                 "path": "/providers/Microsoft.Authorization/elevateAccess",
                 "api-version": ELEVATE_API,
             },
             expected=(
-                "The calling principal receives User Access Administrator "
+                "The current principal receives User Access Administrator "
                 "at the tenant root scope."
             ),
             permissions="Microsoft.Authorization/elevateAccess/action",
@@ -118,9 +154,61 @@ def handle_elevate(ctx: Context, args: Any) -> None:
         params={"api-version": ELEVATE_API},
     )
     ctx.console.line(
-        "Elevated tenant root access: User Access Administrator granted "
-        "to the calling principal."
+        f"Assigned {UAA_ROLE_NAME} at tenant root",
+        style="bold green",
     )
+    ctx.console.kv("Principal", principal)
+    ctx.console.kv("Scope", "/")
+    ctx.console.kv("Role definition ID", UAA_ROLE_ID)
+    ctx.console.line("Propagation may take a few minutes.")
+    ctx.console.blank()
+
+
+def handle_uaa_unassign(ctx: Context, args: Any) -> None:
+    arm = ctx.arm()
+    principal = _current_principal(ctx)
+    matches = _uaa_assignments(arm, principal)
+    if not matches:
+        raise UsageError(
+            f"No {UAA_ROLE_NAME} assignment found for the current principal "
+            "at tenant root scope."
+        )
+    if len(matches) > 1:
+        identifiers = ", ".join(
+            str(assignment.get("id") or assignment.get("name") or "-")
+            for assignment in matches
+        )
+        raise UsageError(
+            f"Multiple {UAA_ROLE_NAME} assignments found for the current "
+            f"principal: {identifiers}."
+        )
+    assignment = matches[0]
+    assignment_id = str(assignment.get("name") or assignment.get("id") or "")
+    if not assignment_id:
+        raise UsageError("The matching role assignment has no ID.")
+    path = f"/providers/Microsoft.Authorization/roleAssignments/{assignment_id}"
+    if ctx.dry_run:
+        dry_run(
+            ctx,
+            action=f"Unassign {UAA_ROLE_NAME} at tenant root",
+            target=f"{principal} <- /",
+            payload={"method": "DELETE", "path": path, "api-version": ROLE_API},
+            expected=(
+                "The current principal loses User Access Administrator at the "
+                "tenant root scope."
+            ),
+            permissions="Microsoft.Authorization/roleAssignments/delete",
+        )
+        return
+    arm.delete(path, params={"api-version": ROLE_API})
+    ctx.console.line(
+        f"Removed {UAA_ROLE_NAME} at tenant root",
+        style="bold green",
+    )
+    ctx.console.kv("Principal", principal)
+    ctx.console.kv("Assignment ID", assignment_id)
+    ctx.console.line("Propagation may take a few minutes.")
+    ctx.console.blank()
 
 
 def handle_role_list(ctx: Context, args: Any) -> None:

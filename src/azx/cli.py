@@ -34,11 +34,12 @@ from .commands.apps import (
 )
 from .commands.auth_cmd import handle_auth_app
 from .commands.azure import (
-    handle_elevate,
     handle_role_assign as azure_role_assign,
     handle_role_list as azure_role_list,
     handle_role_remove as azure_role_remove,
     handle_subscriptions,
+    handle_uaa_assign as azure_uaa_assign,
+    handle_uaa_unassign as azure_uaa_unassign,
 )
 from .commands.groups import (
     handle_add_member,
@@ -362,6 +363,15 @@ def build_parser() -> argparse.ArgumentParser:
         nargs="?",
         metavar="NAME",
         help="Token name; defaults to the active token.",
+    )
+    token_refresh_parser.add_argument(
+        "-r",
+        "--resource",
+        metavar="RESOURCE",
+        help=(
+            "Resource alias or URL for the refresh request; required when the "
+            "stored token has no access token."
+        ),
     )
     token_refresh_parser.set_defaults(func=token_refresh)
 
@@ -788,8 +798,27 @@ def build_parser() -> argparse.ArgumentParser:
     azure_sub = azure.add_subparsers(
         dest="azure_command", required=True, metavar="command"
     )
-    azure_elevate_parser = _command(azure_sub, "elevate", "Elevate tenant root access.")
-    azure_elevate_parser.set_defaults(func=handle_elevate)
+    azure_uaa = _command(
+        azure_sub,
+        "uaa",
+        "Tenant-root User Access Administrator; the portal's 'Access "
+        "management for Azure resources' toggle.",
+    )
+    azure_uaa_sub = azure_uaa.add_subparsers(
+        dest="azure_uaa_command", required=True, metavar="command"
+    )
+    azure_uaa_assign_parser = _command(
+        azure_uaa_sub,
+        "assign",
+        "Grant User Access Administrator at tenant root to the current principal.",
+    )
+    azure_uaa_assign_parser.set_defaults(func=azure_uaa_assign)
+    azure_uaa_unassign_parser = _command(
+        azure_uaa_sub,
+        "unassign",
+        "Remove the current principal's User Access Administrator at tenant root.",
+    )
+    azure_uaa_unassign_parser.set_defaults(func=azure_uaa_unassign)
     azure_subscriptions_parser = _command(
         azure_sub, "subscriptions", "List Azure subscriptions."
     )
