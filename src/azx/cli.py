@@ -41,6 +41,7 @@ from .commands.azure import (
     handle_uaa_assign as azure_uaa_assign,
     handle_uaa_unassign as azure_uaa_unassign,
 )
+from .commands.cba import DEFAULT_REDIRECT_URI, handle_auth_cba
 from .commands.groups import (
     handle_add_member,
     handle_create as group_create,
@@ -436,6 +437,67 @@ def build_parser() -> argparse.ArgumentParser:
         "--force", action="store_true", help="Overwrite an existing token."
     )
     auth_app.set_defaults(func=handle_auth_app)
+
+    auth_cba = _command(
+        auth_sub,
+        "cba",
+        "Cloud certificate-based authentication for delegated tokens.",
+    )
+    auth_cba.add_argument(
+        "-c",
+        "--client",
+        default="azcli",
+        metavar="CLIENT",
+        help="Client alias or application/client ID (default: azcli).",
+    )
+    auth_cba.add_argument(
+        "-r",
+        "--resource",
+        default="msgraph",
+        metavar="RESOURCE",
+        help="Resource alias or resource URL (default: msgraph).",
+    )
+    auth_cba.add_argument(
+        "-t",
+        "--tenant",
+        metavar="TENANT",
+        help="Tenant ID or domain; defaults to the certificate UPN domain.",
+    )
+    auth_cba.add_argument(
+        "--pfx",
+        metavar="PATH",
+        help="PFX/P12 file containing the certificate and private key.",
+    )
+    auth_cba.add_argument(
+        "--pfx-password",
+        metavar="PASSWORD",
+        help="PFX password, if the file is encrypted.",
+    )
+    auth_cba.add_argument(
+        "--cert",
+        metavar="PATH",
+        help="PEM certificate (including chain) when not using --pfx.",
+    )
+    auth_cba.add_argument(
+        "--key",
+        metavar="PATH",
+        help="PEM private key when not using --pfx.",
+    )
+    auth_cba.add_argument(
+        "--redirect-uri",
+        metavar="URI",
+        help=f"Redirect URI (default: {DEFAULT_REDIRECT_URI}).",
+    )
+    auth_cba.add_argument(
+        "-n",
+        "--name",
+        metavar="NAME",
+        help="Token name; generated when omitted.",
+    )
+    auth_cba.add_argument(
+        "--force", action="store_true", help="Overwrite an existing token."
+    )
+    auth_cba.set_defaults(func=handle_auth_cba)
 
     auth_seamless = _command(
         auth_sub,
